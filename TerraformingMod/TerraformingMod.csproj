@@ -64,5 +64,8 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="TerraformingSaveFile.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <Content Include="TODO.md" />
+  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
