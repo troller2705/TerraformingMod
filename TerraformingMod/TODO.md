@@ -1,8 +1,6 @@
 ﻿# Terraforming Mod - Update TODO List
 
 ## 1. Workspace & Architecture
-- [x] Set up BepInEx plugin class.
-- [ ] Remove all legacy `StationeersMods` boilerplate code to maintain a clean workspace.
 - [ ] Verify assembly references point to the latest `Assembly-CSharp.dll`, `UnityEngine.CoreModule.dll`, `0Harmony.dll`, and `BepInEx.dll`.
 
 ## 2. Atmospherics & Chemistry API
