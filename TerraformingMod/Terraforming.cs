@@ -1,3 +1,5 @@
+#pragma warning disable IDE1006 // Suppress Harmony Naming Style Warnings
+
 using System;
 using System.Collections.Generic;
 using System.Reflection.Emit;
@@ -15,95 +17,64 @@ using Assets.Scripts.Serialization;
 using static Assets.Scripts.Atmospherics.Chemistry;
 using TerraformingMod.Tools;
 using System.Reflection;
-using Assets.Scripts.Objects.Items;
 
 namespace TerraformingMod
 {
-    [HarmonyPatch(typeof(Atmosphere), "LerpAtmosphere")]
-    public class AtmosphereLerpAtmospherePatch
+    public class GasMixSaveData
     {
-        [HarmonyPrefix]
-        public static void Prefix(Atmosphere __instance, Atmosphere targetAtmos, ref GasMixture __state)
+        public Dictionary<string, float> Moles = new Dictionary<string, float>();
+
+        public GasMixSaveData() { }
+
+        public GasMixSaveData(GasMixture mix)
         {
-            if (!NetworkManager.IsClient && targetAtmos.IsGlobalAtmosphere)
+            foreach (var type in SimpleGasMixture.BaseGases)
             {
-                __state = new GasMixture(__instance.GasMixture);
-                return;
-            }
-
-            __state = GasMixtureHelper.Invalid;
-        }
-
-        [HarmonyPostfix]
-        public static void Postfix(Atmosphere __instance, Atmosphere targetAtmos, GasMixture __state)
-        {
-            if (TerraformingFunctions.ThisGlobalPrecise == null)
-                return;
-
-            if (!NetworkManager.IsClient && targetAtmos.IsGlobalAtmosphere)
-            {
-                var change = TerraformingFunctions.GasMixCompair(__instance.GasMixture, __state);
-                TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphereChange(change);
+                Moles[type.ToString()] = mix.GetMoleValue(type).Quantity.ToFloat();
             }
         }
-    }
 
-    [HarmonyPatch(typeof(Atmosphere), "TakeAtmospherePortion")]
-    public class AtmospherTakeAtmospherePortionPatch
-    {
-        [HarmonyPrefix]
-        public static void Prefix(Atmosphere __instance, Atmosphere atmosphere, ref GasMixture __state, GasMixture ____totalMixInWorldGasMix)
+        public GasMixture Apply()
         {
-            if (!NetworkManager.IsClient && atmosphere.IsGlobalAtmosphere)
+            GasMixture mix = GasMixtureHelper.Create();
+            foreach (var kvp in Moles)
             {
-                __state = new GasMixture(____totalMixInWorldGasMix);
-                return;
-            }
-
-            __state = GasMixtureHelper.Invalid;
-        }
-
-        [HarmonyPostfix]
-        public static void Postfix(Atmosphere __instance, Atmosphere atmosphere, GasMixture __state, GasMixture ____totalMixInWorldGasMix)
-        {
-            if (TerraformingFunctions.ThisGlobalPrecise == null)
-                return;
-
-            if (!NetworkManager.IsClient && atmosphere.IsGlobalAtmosphere)
-            {
-                var change = TerraformingFunctions.GasMixCompair(____totalMixInWorldGasMix, __state);
-                TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphereChange(change);
-            }
-        }
-    }
-
-    [HarmonyPatch(typeof(Atmosphere), "GiveAtmospheresMixInWorld")]
-    public class AtmospherGiveAtmospheresMixInWorldPatch
-    {
-        [HarmonyPrefix]
-        public static void Prefix(Atmosphere __instance, object ____mixingAtmos, float ____totalMixInWorldGiveWeight, GasMixture ____totalMixInWorldGasMix)
-        {
-            if (NetworkManager.IsClient || TerraformingFunctions.ThisGlobalPrecise == null)
-                return;
-
-            var atmoList = ____mixingAtmos as System.Collections.IEnumerable;
-            if (atmoList == null)
-                return;
-
-            foreach (var entry in atmoList)
-            {
-                var traverse = Traverse.Create(entry);
-                var atmo = traverse.Field("atmos").GetValue() as Atmosphere;
-                float giveWeight = traverse.Field("GiveWeight").GetValue<float>();
-
-                if (atmo != null && atmo.IsGlobalAtmosphere)
+                if (Enum.TryParse(kvp.Key, out Chemistry.GasType type))
                 {
-                    float ratio = giveWeight / ____totalMixInWorldGiveWeight;
-                    var gasMixture = new SimpleGasMixture(____totalMixInWorldGasMix);
-                    gasMixture.Scale(ratio);
-
-                    TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphereChange(gasMixture);
+                    mix.Add(new Mole(type, new MoleQuantity((double)kvp.Value), MoleEnergy.Zero));
                 }
+            }
+            return mix;
+        }
+    }
+
+    // 1. Capture gas leaving pipes/rooms and entering the world
+    [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "GiveToGlobal")]
+    public class PlanetaryAtmosphereGivePatch
+    {
+        [HarmonyPrefix]
+        public static void Prefix(GasMixture gasMixture)
+        {
+            if (!NetworkManager.IsClient && TerraformingFunctions.ThisGlobalPrecise != null && gasMixture.IsValid)
+            {
+                var change = new SimpleGasMixture(gasMixture);
+                TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphereChange(change);
+            }
+        }
+    }
+
+    // 2. Capture gas being vacuumed out of the world into pipes/rooms
+    [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "TakeGlobalMoles")]
+    public class PlanetaryAtmosphereTakePatch
+    {
+        [HarmonyPostfix]
+        public static void Postfix(GasMixture __result)
+        {
+            if (!NetworkManager.IsClient && TerraformingFunctions.ThisGlobalPrecise != null && __result.IsValid)
+            {
+                var change = new SimpleGasMixture(__result);
+                change.Scale(-1.0); // Negate because gas is being removed from the planet
+                TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphereChange(change);
             }
         }
     }
@@ -114,14 +85,16 @@ namespace TerraformingMod
         [HarmonyPrefix]
         public static void Prefix(Atmosphere atmosphere)
         {
-            if (!NetworkManager.IsClient && atmosphere != null && atmosphere.Mode == AtmosphereHelper.AtmosphereMode.World && atmosphere.Room == null && atmosphere.IsCloseToGlobal(AtmosphereHelper.GlobalAtmosphereNeighbourThreshold / 6f * AtmosphereHelper.NewAtmosSupressionMultiplier()))
+            // CRITICAL: Abort if we are on the main menu or global is null
+            if (TerraformingFunctions.ThisGlobalPrecise == null || TerraformingFunctions.GlobalAtmosphere == null) return;
+
+            if (!NetworkManager.IsClient && atmosphere != null && atmosphere.Mode == AtmosphereHelper.AtmosphereMode.World && atmosphere.Room == null && atmosphere.IsCloseToGlobal(new PressurekPa((double)AtmosphereHelper.GlobalAtmosphereNeighbourThreshold / 6.0 * (double)AtmosphereHelper.NewAtmosSupressionMultiplier())))
             {
-                // scale the volume up to the size of the global atmosphere, or the values will be off
                 var mixture = GasMixtureHelper.Create();
                 mixture.Add(atmosphere.GasMixture);
-                mixture.Scale(TerraformingFunctions.GlobalAtmosphere.Volume / atmosphere.Volume);
+                
+                mixture.Scale(TerraformingFunctions.GlobalAtmosphere.Volume.ToDouble() / atmosphere.Volume.ToDouble());
 
-                // check the difference to global and compensate for it
                 var change = TerraformingFunctions.GasMixCompair(TerraformingFunctions.GlobalAtmosphere.GasMixture, mixture);
                 TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphereChange(change);
             }
@@ -131,17 +104,16 @@ namespace TerraformingMod
     [HarmonyPatch(typeof(WorldManager), "StartWorld")]
     public class WorldManagerStartWorldPatch
     {
-        [HarmonyPrefix]
-        public static void Prefix()
+        [HarmonyPostfix]
+        public static void Postfix()
         {
-            if (NetworkManager.IsClient) // on clients, bail out here, settings are not loaded yet.
+            if (NetworkManager.IsClient) 
                 return;
 
             LightManager.SunPathTraceWorldAtmos = true;
             TerraformingFunctions.ThisGlobalPrecise = new GlobalAtmospherePrecise(Mathf.Abs(WorldSetting.Current.Gravity));
-            TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = WorldSetting.Current.GlobalGasMixture;
+            TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = GasMixtureHelper.Create();
 
-            // load saved atmosphere
             if (XmlSaveLoad.Instance.CurrentWorldSave != null)
             {
                 var fileName = TerraformingSaveFile.GetCurrentSaveFileName();
@@ -161,7 +133,6 @@ namespace TerraformingMod
                 }
             }
 
-            // ensure the global atmosphere is being synced as needed
             TerraformingFunctions.ReloadGlobalAtmosphere();
             var globalAtmo = TerraformingFunctions.GlobalAtmosphere;
             if (globalAtmo != null)
@@ -169,9 +140,14 @@ namespace TerraformingMod
             else
                 ConsoleWindow.Print("Terraforming: Global Atmosphere is not valid");
 
-            // update Solar Irradiance now for an accurate value right from here on out
-            var value = typeof(OrbitalSimulation).GetMethod("CalculateSolarIrradiance", BindingFlags.NonPublic | BindingFlags.Instance, null, new Type[0], null).Invoke(OrbitalSimulation.System, null);
-            Traverse.Create(typeof(OrbitalSimulation)).Property("SolarIrradiance").SetValue(value);
+            if (OrbitalSimulation.System != null)
+            {
+                var value = typeof(OrbitalSimulation).GetMethod("CalculateSolarIrradiance", BindingFlags.NonPublic | BindingFlags.Instance, null, new Type[0], null)?.Invoke(OrbitalSimulation.System, null);
+                if (value != null)
+                {
+                    Traverse.Create(typeof(OrbitalSimulation)).Property("SolarIrradiance").SetValue(value);
+                }
+            }
 
             ConsoleWindow.Print($"Terraforming: GlobalPrecise generated (Terraforming mod loaded on server)");
         }
@@ -183,12 +159,12 @@ namespace TerraformingMod
         [HarmonyPostfix]
         public static void Postfix()
         {
-            if (!NetworkManager.IsClient) // on server, this should not fire
+            if (!NetworkManager.IsClient) 
                 return;
 
             LightManager.SunPathTraceWorldAtmos = true;
             TerraformingFunctions.ThisGlobalPrecise = new GlobalAtmospherePrecise(Mathf.Abs(WorldSetting.Current.Gravity));
-            TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = WorldSetting.Current.GlobalGasMixture;
+            TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = GasMixtureHelper.Create();
             TerraformingFunctions.ReloadGlobalAtmosphere();
             ConsoleWindow.Print("GlobalPrecise generated (Terraforming mod loaded on client)");
         }
@@ -202,7 +178,6 @@ namespace TerraformingMod
         {
             if (atmos != null && !atmos.BeingDestroyed && !atmos.IsNaN() && atmos == TerraformingFunctions.GlobalAtmosphere)
             {
-                // only send the global atmosphere if the gas quantities changed, or a join is in progress
                 __result = (atmos.GasMixture.GasQuantitiesDirtied() != 0) || TerraformingFunctions.JoinInProgress;
                 return false;
             }
@@ -210,7 +185,6 @@ namespace TerraformingMod
             return true;
         }
     }
-
 
     [HarmonyPatch(typeof(AtmosphericsManager), "SerialiseOnJoin")]
     public class AtmosphericsManagerSerialiseOnJoin
@@ -228,166 +202,59 @@ namespace TerraformingMod
         }
     }
 
+    /* MULTIPLAYER IL TRANSPILER DISABLED TEMPORARILY
     [HarmonyPatch(typeof(AtmosphereHelper), "ReadStatic")]
-    public class AtmosphereHelperReadStaticPatch
-    {
-        [HarmonyTranspiler]
-        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator il)
-        {
-            var codes = instructions.ToList();
+    public class AtmosphereHelperReadStaticPatch { ... }
+    */
 
-            // hash to ensure the function didnt change and we might do bad things
-            if (codes.HashInstructionsHex() != "cbeeb1b5")
-            {
-                ConsoleWindow.Print($"TerraformingMod: Code change detected ({codes.HashInstructionsHex()}), AtmosphereHelper ReadStatic patch disabled", ConsoleColor.Red);
-                return codes.AsEnumerable();
-            }
-
-            System.Reflection.Emit.Label skipGlobalLabel = il.DefineLabel();
-
-            // the end of the function should look like this, which we're adapting:
-            /*
-	            IL_0145: ldloc.3
-	            IL_0146: ldarg.0
-	            IL_0147: ldloc.1
-	            IL_0148: callvirt instance void Assets.Scripts.Atmospherics.Atmosphere::Read(class Assets.Scripts.Networking.RocketBinaryReader, uint8)
-	            IL_014d: ret
-
-                Local index 1 = Network Flags ("b")
-                Local index 2 = Atmosphere Mode
-                Local index 3 = Atmosphere
-            */
-
-            // insert a branch before the call to the Read function
-            int Index = codes.Count - 5;
-            codes[Index].labels.Add(skipGlobalLabel); // store a skip label at the old instruction
-
-            // Add a branch before the reading of the atmosphere, which will set the current GasMix to the atmosphere
-            // this ensures we can detect any changes to the atmosphere properly
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Ldloc, 2)); // load atmosphereMode
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Ldc_I4, 3)); // load Mode=Global
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Bne_Un_S, skipGlobalLabel)); // skip branch if not equal
-
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Ldloc, 3)); // load Atmosphere
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Ldloc, 1)); // load network flags ("b")
-            codes.Insert(Index++, CodeInstruction.Call(typeof(AtmosphereHelperReadStaticPatch), "PrepareReadingGlobalAtmosphere"));
-
-            // jump to last instruction
-            // at the end of the function, take the now updated Atmosphere, and update the GlobalAtmosphere with its values
-            Index = codes.Count - 1;
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Ldloc, 3)); // load Atmosphere
-            codes.Insert(Index++, new CodeInstruction(OpCodes.Ldloc, 1)); // load network flags ("b")
-            codes.Insert(Index++, CodeInstruction.Call(typeof(AtmosphereHelperReadStaticPatch), "ProcessGlobalAtmosphere"));
-
-            return codes.AsEnumerable();
-        }
-
-        public static void PrepareReadingGlobalAtmosphere(Atmosphere atmosphere, byte networkUpdateFlags)
-        {
-            if (atmosphere != null && atmosphere.Mode == AtmosphereHelper.AtmosphereMode.Global)
-            {
-                if (AtmosphereHelper.IsNetworkUpdateRequired(64, networkUpdateFlags))
-                {
-                    atmosphere.GasMixture.Set(TerraformingFunctions.GlobalAtmosphere.GasMixture);
-                }
-            }
-        }
-
-        public static void ProcessGlobalAtmosphere(Atmosphere atmosphere, byte networkUpdateFlags)
-        {
-            if (atmosphere != null && atmosphere.Mode == AtmosphereHelper.AtmosphereMode.Global)
-            {
-                if (AtmosphereHelper.IsNetworkUpdateRequired(64, networkUpdateFlags))
-                {
-                    // ConsoleWindow.Print("Updating global atmosphere GasMixture");
-                    var globalAtmosphere = TerraformingFunctions.GlobalAtmosphere;
-                    globalAtmosphere.GasMixture.SetReadOnly(false);
-                    globalAtmosphere.GasMixture.Set(atmosphere.GasMixture);
-                    globalAtmosphere.GasMixture.SetReadOnly(true);
-                    globalAtmosphere.GasMixture.UpdateCache();
-                }
-            }
-        }
-    }
+    /* SAVE PIPELINE DISABLED TEMPORARILY
     [HarmonyPatch(typeof(XmlSaveLoad), "WriteWorld")]
-    public class WorldManagerExportWorldSettingDataPatch
-    {
-        [HarmonyPrefix]
-        public static void Prefix(out uint __state)
-        {
-            //collect the backup index before its been incremented
-            __state = TerraformingSaveFile.GetBackupIndex();
-        }
+    public class WorldManagerExportWorldSettingDataPatch { ... }
+    */
 
+    // 3. Override the engine's core weather/temperature calculations with Terraforming Math
+    [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "CacheTemperatureCurveOffsets")]
+    public class PlanetaryAtmosphereSimulationTemperaturePatch
+    {
         [HarmonyPostfix]
-        public static void Postfix(ref string worldDirectory, bool doBackup, bool autoSave, uint __state)
+        public static void Postfix()
         {
             if (TerraformingFunctions.ThisGlobalPrecise != null)
             {
-                var tempFileName = TerraformingSaveFile.GetFullTempFileName(worldDirectory);
-
-                // write out the global atmosphere
-                var saveAtmosphere = new TerraformingAtmosphere();
-                saveAtmosphere.GasMix = new GasMixSaveData(TerraformingFunctions.GlobalAtmosphere.GasMixture);
-                if (!XmlSerialization.Serialization(TerraformingFunctions.AtmoSerializer, saveAtmosphere, tempFileName))
+                Atmosphere readOnlyGlobal = PlanetaryAtmosphereSimulation.ReadOnlyGlobal(new WorldGrid(0, 0, 0));
+                if (readOnlyGlobal != null && !readOnlyGlobal.BeingDestroyed)
                 {
-                    ConsoleWindow.Print("Error Saving Terraforming Atmosphere: " + tempFileName, ConsoleColor.Red);
-                    return;
+                    // Calculate the terraforming temperature
+                    float terraformTemp = TerraformingFunctions.GetTemperature(OrbitalSimulation.TimeOfDay, readOnlyGlobal.GasMixture);
+                    
+                    // Override the game's calculated aggregate temperature with our terraformed temperature
+                    PlanetaryAtmosphereSimulation.AggregateTemperature = new TemperatureKelvin(terraformTemp);
                 }
-                // move file into the right place
-                var realFileName = TerraformingSaveFile.GetFullSaveFileName(worldDirectory);
-                try
-                {
-                    if (File.Exists(realFileName))
-                    {
-                        File.Delete(realFileName);
-                    }
-                    File.Move(tempFileName, realFileName);
-                }
-                catch (Exception ex)
-                {
-                    ConsoleWindow.Print("Error Renaming Temporary Save Files: " + ex.Message, ConsoleColor.Red);
-                    return;
-                }
-
-                if (doBackup)
-                {
-                    var backupFileName = TerraformingSaveFile.GetFullBackupFileName(worldDirectory, __state, autoSave);
-                    try
-                    {
-                        File.Copy(realFileName, backupFileName);
-                    }
-                    catch (Exception ex)
-                    {
-                        ConsoleWindow.Print("Error creating Backup File: " + ex.Message, ConsoleColor.Red);
-                        return;
-                    }
-
-                    TerraformingSaveFile.DeleteOldBackupFiles(worldDirectory);
-                }
-                ConsoleWindow.Print("Exported Terraforming Atmosphere");
             }
         }
     }
 
-    [HarmonyPatch(typeof(AtmosphericsController), "UpdateGlobalAtmosphereWorldTemperature")]
-    public class AtmosphereUpdateGlobalAtmosphereWorldTemperaturePatch
+    // 4. Force the planet to use the Terraforming gas mixture every tick
+    [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "TickPlanetarySimulation")]
+    public class PlanetaryAtmosphereSimulationTickPatch
     {
-        [HarmonyPrefix]
-        public static bool Prefix(Atmosphere ____globalAtmosphere)
+        [HarmonyPostfix]
+        public static void Postfix()
         {
-            if (TerraformingFunctions.ThisGlobalPrecise != null)
+            if (!NetworkManager.IsClient && TerraformingFunctions.ThisGlobalPrecise != null)
             {
-                float temp = TerraformingFunctions.GetTemperature(OrbitalSimulation.TimeOfDay, ____globalAtmosphere.GasMixture) + WorldManager.EventModTemperature;
-                TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphere(temp, ____globalAtmosphere);
+                Atmosphere readOnlyGlobal = PlanetaryAtmosphereSimulation.ReadOnlyGlobal(new WorldGrid(0, 0, 0));
+                if (readOnlyGlobal != null && !readOnlyGlobal.BeingDestroyed)
+                {
+                    // Update global mixture (which also updates energy via the heat capacity)
+                    TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphere(PlanetaryAtmosphereSimulation.AggregateTemperature.ToFloat(), readOnlyGlobal);
+                }
             }
-            return false;
         }
     }
 
     public class TerraformingFunctions
     {
-
         public static GlobalAtmospherePrecise ThisGlobalPrecise;
 
         [ThreadStatic]
@@ -397,7 +264,7 @@ namespace TerraformingMod
 
         public static void ReloadGlobalAtmosphere()
         {
-            GlobalAtmosphere = AtmosphericsController.GlobalAtmosphere(new Grid3(0));
+            GlobalAtmosphere = AtmosphericsController.ReadonlyGlobalAtmosphere(new Grid3(0));
         }
 
         public static float GetTemperature(float timeOfDay, GasMixture gasMix)
@@ -409,26 +276,32 @@ namespace TerraformingMod
             float temp = temperatureBase + Mathf.Sin(timeOfDay * 2f * Mathf.PI - Mathf.PI / 4) * temperatureDelta / 2;
             return temp;
         }
+
         public static List<SpawnGas> UpdateWorldSetting(GasMixture globalGasMixture)
         {
             List<SpawnGas> currentSpawnGas = new List<SpawnGas>();
-            foreach (GasType type in GlobalAtmospherePrecise.gasTypes)
+            foreach (GasType type in GlobalAtmospherePrecise.thermoGases)
             {
-                currentSpawnGas.Add(new SpawnGas(type, globalGasMixture.GetMoleValue(type).Quantity));
+                float qty = globalGasMixture.GetMoleValue(type).Quantity.ToFloat();
+                if (qty > 0)
+                {
+                    currentSpawnGas.Add(new SpawnGas(type, qty));
+                }
             }
             return currentSpawnGas;
         }
+
         public static SimpleGasMixture GasMixCompair(GasMixture original1, GasMixture original2)
         {
             SimpleGasMixture result = new SimpleGasMixture();
-            foreach (GasType type in GlobalAtmospherePrecise.gasTypes)
+            foreach (GasType type in SimpleGasMixture.BaseGases)
             {
-                double num = (double)original2.GetMoleValue(type).Quantity - (double)original1.GetMoleValue(type).Quantity;
+                double num = original2.GetMoleValue(type).Quantity.ToDouble() - original1.GetMoleValue(type).Quantity.ToDouble();
                 result.SetType(type, num);
             }
-
             return result;
         }
+
         private static XmlSerializer _atmoSerializer = null;
         public static XmlSerializer AtmoSerializer
         {
@@ -444,241 +317,107 @@ namespace TerraformingMod
             }
         }
     }
+
     public class SimpleGasMixture
     {
-        public SimpleGasMixture() {}
-        public SimpleGasMixture(GasMixture gasMixture)
+        public static readonly GasType[] BaseGases = new GasType[]
         {
-            foreach (GasType type in GlobalAtmospherePrecise.gasTypes)
+            GasType.Oxygen, GasType.Nitrogen, GasType.CarbonDioxide, GasType.Methane,
+            GasType.Pollutant, GasType.Water, GasType.NitrousOxide, GasType.LiquidNitrogen,
+            GasType.LiquidOxygen, GasType.LiquidMethane, GasType.Steam, GasType.LiquidCarbonDioxide,
+            GasType.LiquidPollutant, GasType.LiquidNitrousOxide, GasType.Hydrogen, GasType.LiquidHydrogen,
+            GasType.PollutedWater, GasType.Hydrazine, GasType.LiquidHydrazine, GasType.LiquidAlcohol,
+            GasType.Helium, GasType.LiquidSodiumChloride, GasType.Silanol, GasType.LiquidSilanol,
+            GasType.HydrochloricAcid, GasType.LiquidHydrochloricAcid, GasType.Ozone, GasType.LiquidOzone
+        };
+
+        public Dictionary<GasType, double> Moles = new Dictionary<GasType, double>();
+
+        public SimpleGasMixture()
+        {
+            foreach (var type in BaseGases) Moles[type] = 0.0;
+        }
+
+        public SimpleGasMixture(GasMixture gasMixture) : this()
+        {
+            foreach (var type in BaseGases)
             {
-                SetType(type, gasMixture.GetMoleValue(type).Quantity);
+                Moles[type] = gasMixture.GetMoleValue(type).Quantity.ToDouble();
             }
         }
 
-        public double Pollutant { get; set; }
-        public double LiquidPollutant { get; set; }
-        public double CarbonDioxide { get; set; }
-        public double LiquidCarbonDioxide { get; set; }
-        public double Oxygen { get; set; }
-        public double LiquidOxygen { get; set; }
-        public double Volatiles { get; set; }
-        public double LiquidVolatiles { get; set; }
-        public double Nitrogen { get; set; }
-        public double LiquidNitrogen { get; set; }
-        public double NitrousOxide { get; set; }
-        public double LiquidNitrousOxide { get; set; }
-        public double Water { get; set; }
-        public double Steam { get; set; }
-        public double PollutedWater { get; set; }
-
         public void Reset()
         {
-            Pollutant = 0;
-            LiquidPollutant = 0;
-            CarbonDioxide = 0;
-            LiquidCarbonDioxide = 0;
-            Oxygen = 0;
-            LiquidOxygen = 0;
-            Volatiles = 0;
-            LiquidVolatiles = 0;
-            Nitrogen = 0;
-            LiquidNitrogen = 0;
-            NitrousOxide = 0;
-            LiquidNitrousOxide = 0;
-            Water = 0;
-            Steam = 0;
-            PollutedWater = 0;
+            var keys = new List<GasType>(Moles.Keys);
+            foreach (var key in keys) Moles[key] = 0.0;
         }
 
         public void Scale(double scale)
         {
-            Pollutant *= scale;
-            LiquidPollutant *= scale;
-            CarbonDioxide *= scale;
-            LiquidCarbonDioxide *= scale;
-            Oxygen *= scale;
-            LiquidOxygen *= scale;
-            Volatiles *= scale;
-            LiquidVolatiles *= scale;
-            Nitrogen *= scale;
-            LiquidNitrogen *= scale;
-            NitrousOxide *= scale;
-            LiquidNitrousOxide *= scale;
-            Water *= scale;
-            Steam *= scale;
-            PollutedWater *= scale;
+            var keys = new List<GasType>(Moles.Keys);
+            foreach (var key in keys) Moles[key] *= scale;
         }
 
         public double Add(SimpleGasMixture gasMix)
         {
-            double AddedMoles = 0;
-            foreach (GasType type in GlobalAtmospherePrecise.gasTypes)
+            double addedMoles = 0;
+            foreach (var type in BaseGases)
             {
-                var add = gasMix.GetType(type);
-                SetType(type, GetType(type) + add);
-                AddedMoles += add;
+                Moles[type] += gasMix.Moles[type];
+                addedMoles += gasMix.Moles[type];
             }
-
-            return AddedMoles;
+            return addedMoles;
         }
 
         public void SetType(GasType gasType, double quantity)
         {
-            switch (gasType)
-            {
-                case GasType.Undefined:
-                    break;
-                case GasType.Oxygen:
-                    Oxygen = quantity;
-                    break;
-                case GasType.Nitrogen:
-                    Nitrogen = quantity;
-                    break;
-                case GasType.CarbonDioxide:
-                    CarbonDioxide = quantity;
-                    break;
-                case GasType.Volatiles:
-                    Volatiles = quantity;
-                    break;
-                case GasType.Pollutant:
-                    Pollutant = quantity;
-                    break;
-                case GasType.Water:
-                    Water = quantity;
-                    break;
-                case GasType.NitrousOxide:
-                    NitrousOxide = quantity;
-                    break;
-                case GasType.LiquidOxygen:
-                    LiquidOxygen = quantity;
-                    break;
-                case GasType.LiquidNitrogen:
-                    LiquidNitrogen = quantity;
-                    break;
-                case GasType.LiquidCarbonDioxide:
-                    LiquidCarbonDioxide = quantity;
-                    break;
-                case GasType.LiquidVolatiles:
-                    LiquidVolatiles = quantity;
-                    break;
-                case GasType.LiquidPollutant:
-                    LiquidPollutant = quantity;
-                    break;
-                case GasType.Steam:
-                    Steam = quantity;
-                    break;
-                case GasType.LiquidNitrousOxide:
-                    LiquidNitrousOxide = quantity;
-                    break;
-                case GasType.PollutedWater:
-                    PollutedWater = quantity;
-                    break;
-                default:
-                    break;
-            }
+            if (Moles.ContainsKey(gasType)) Moles[gasType] = quantity;
         }
 
         public double GetType(GasType gasType)
         {
-            switch (gasType)
-            {
-                case GasType.Undefined:
-                    break;
-                case GasType.Oxygen:
-                    return Oxygen;
-                case GasType.Nitrogen:
-                    return Nitrogen;
-                case GasType.CarbonDioxide:
-                    return CarbonDioxide;
-                case GasType.Volatiles:
-                    return Volatiles;
-                case GasType.Pollutant:
-                    return Pollutant;
-                case GasType.Water:
-                    return Water;
-                case GasType.NitrousOxide:
-                    return NitrousOxide;
-                case GasType.LiquidOxygen:
-                    return LiquidOxygen;
-                case GasType.LiquidNitrogen:
-                    return LiquidNitrogen;
-                case GasType.LiquidCarbonDioxide:
-                    return LiquidCarbonDioxide;
-                case GasType.LiquidVolatiles:
-                    return LiquidVolatiles;
-                case GasType.LiquidPollutant:
-                    return LiquidPollutant;
-                case GasType.Steam:
-                    return Steam;
-                case GasType.LiquidNitrousOxide:
-                    return LiquidNitrousOxide;
-                case GasType.PollutedWater:
-                    return PollutedWater;
-                default:
-                    break;
-            }
-
-            return 0.0;
+            return Moles.ContainsKey(gasType) ? Moles[gasType] : 0.0;
         }
     }
+
     public class GlobalAtmospherePrecise : SimpleGasMixture
     {
-
-        public static GasType[] gasTypes = new GasType[]
+        public static GasType[] thermoGases = new GasType[]
         {
             GasType.Pollutant, 
             GasType.CarbonDioxide,
             GasType.Oxygen,
-            GasType.Volatiles, 
+            GasType.Methane, 
             GasType.Nitrogen, 
             GasType.NitrousOxide, 
             GasType.Water, 
             GasType.LiquidPollutant, 
             GasType.LiquidCarbonDioxide,
             GasType.LiquidOxygen,
-            GasType.LiquidVolatiles, 
+            GasType.LiquidMethane, 
             GasType.LiquidNitrogen, 
             GasType.LiquidNitrousOxide, 
             GasType.Steam, 
             GasType.PollutedWater
         };
+        
         public static double worldSize;
         public static double[] baseFactors = new double[]
         {
-            10.651413866149,
-            1.00348304229291,
-            0.202490458429832,
-            8.55023708508486,
-            -0.320563285816776,
-            -1.288345881,
-            0, //water
-            10.651413866149,
-            1.00348304229291,
-            0.202490458429832,
-            8.55023708508486,
-            -0.320563285816776,
-            -1.288345881,
-            -3.14159265359, //steam
-            0
+            10.651413866149, 1.00348304229291, 0.202490458429832, 8.55023708508486,
+            -0.320563285816776, -1.288345881, 0, 10.651413866149, 1.00348304229291,
+            0.202490458429832, 8.55023708508486, -0.320563285816776, -1.288345881,
+            -3.14159265359, 0
         };
+        
         public static double[] deltaFactors = new double[]
         {
-            1.03921006683661,
-            -0.014557418735896,
-            -0.0250754001733472,
-            19.5280403386664,
-            0.314249023692835,
-            -0.987064019,
-            -3.14159265359, //water
-            1.03921006683661,
-            -0.014557418735896,
-            -0.0250754001733472,
-            19.5280403386664,
-            0.314249023692835,
-            -0.987064019,
-            -1.14159265359, //steam
-            0
+            1.03921006683661, -0.014557418735896, -0.0250754001733472, 19.5280403386664,
+            0.314249023692835, -0.987064019, -3.14159265359, 1.03921006683661,
+            -0.014557418735896, -0.0250754001733472, 19.5280403386664, 0.314249023692835,
+            -0.987064019, -1.14159265359, 0
         };
+        
         public static double baseSolarScale = 8.99241762372131;
         public static double deltaSolarScale = 3.21847718465672;
         public static double baseTQ = -0.0128394753903387;
@@ -712,55 +451,44 @@ namespace TerraformingMod
         {
             lock (this)
             {
-                // add to accumulator, and only update the global atmosphere if there is a significant change
                 GasMixAccumulatorMoles += GasMixAccumulater.Add(change);
                 if (Math.Abs(GasMixAccumulatorMoles) <= 1)
                     return;
 
-                // re-scale for world scale
                 GasMixAccumulater.Scale(worldScale);
-
-                // add to this mix
                 Add(GasMixAccumulater);
-
-                // reset
                 GasMixAccumulater.Reset();
                 GasMixAccumulatorMoles = 0;
             }
         }
+
         public void UpdateGlobalAtmosphere(float temp, Atmosphere GlobalAtmosphere)
         {
             GlobalAtmosphere.GasMixture.SetReadOnly(false);
-            if (!NetworkManager.IsClient) // clients only update temperature, servers controls atmosphere
+            if (!NetworkManager.IsClient) 
             {
                 GlobalAtmosphere.GasMixture.Set(OnLoadMix);
-                GlobalAtmosphere.GasMixture.Pollutant.Quantity += (float)Pollutant;
-                GlobalAtmosphere.GasMixture.LiquidPollutant.Quantity += (float)LiquidPollutant;
-                GlobalAtmosphere.GasMixture.CarbonDioxide.Quantity += (float)CarbonDioxide;
-                GlobalAtmosphere.GasMixture.LiquidCarbonDioxide.Quantity += (float)LiquidCarbonDioxide;
-                GlobalAtmosphere.GasMixture.Oxygen.Quantity += (float)Oxygen;
-                GlobalAtmosphere.GasMixture.LiquidOxygen.Quantity += (float)LiquidOxygen;
-                GlobalAtmosphere.GasMixture.Volatiles.Quantity += (float)Volatiles;
-                GlobalAtmosphere.GasMixture.LiquidVolatiles.Quantity += (float)LiquidVolatiles;
-                GlobalAtmosphere.GasMixture.Nitrogen.Quantity += (float)Nitrogen;
-                GlobalAtmosphere.GasMixture.LiquidNitrogen.Quantity += (float)LiquidNitrogen;
-                GlobalAtmosphere.GasMixture.NitrousOxide.Quantity += (float)NitrousOxide;
-                GlobalAtmosphere.GasMixture.LiquidNitrousOxide.Quantity += (float)LiquidNitrousOxide;
-                GlobalAtmosphere.GasMixture.Water.Quantity += (float)Water;
-                GlobalAtmosphere.GasMixture.Steam.Quantity += (float)Steam;
-                GlobalAtmosphere.GasMixture.PollutedWater.Quantity += (float)PollutedWater;
+                foreach (var type in BaseGases)
+                {
+                    if (Moles[type] > 0)
+                    {
+                        GlobalAtmosphere.GasMixture.Add(new Mole(type, new MoleQuantity(Moles[type]), MoleEnergy.Zero));
+                    }
+                }
             }
-            float num = temp * GlobalAtmosphere.GasMixture.HeatCapacity;
+            
+            float num = temp * GlobalAtmosphere.GasMixture.HeatCapacity.ToFloat();
             if (!float.IsNaN(temp))
             {
-                GlobalAtmosphere.GasMixture.TotalEnergy = num;
+                GlobalAtmosphere.GasMixture.TotalEnergy = new MoleEnergy((double)num);
             }
+            
             if (!NetworkManager.IsClient && GlobalAtmosphere.PressureGassesAndLiquidsInPa > rootGravity * pressureGravityFactorInPa)
             {
                 float num1 = (float)(rootGravity * pressureGravityFactorInPa / GlobalAtmosphere.PressureGassesAndLiquidsInPa);
-                _OnLoadMix.Scale(num1);
                 Scale(num1);
             }
+            
             GlobalAtmosphere.GasMixture.SetReadOnly(true);
             GlobalAtmosphere.UpdateCache();
         }
@@ -769,31 +497,30 @@ namespace TerraformingMod
         {
             double temperature = 0;
             temperature += baseSolarScale * rootIrridiance;
-            for (int i = 0; i < gasTypes.Length; i++)
+            for (int i = 0; i < thermoGases.Length; i++)
             {
                 if (baseFactors[i] != 0)
                 {
-                    temperature += baseFactors[i] * Math.Sqrt(globalMix.GetGasTypeRatio(gasTypes[i])) * globalMix.GetMoleValue(gasTypes[i]).Quantity;
+                    temperature += baseFactors[i] * Math.Sqrt(globalMix.GetGasTypeRatio(thermoGases[i])) * globalMix.GetMoleValue(thermoGases[i]).Quantity.ToDouble();
                 }
             }
-            temperature += baseTQ * globalMix.TotalMolesGassesAndLiquids;
-
+            temperature += baseTQ * globalMix.GetTotalMolesGassesAndLiquids.ToDouble();
             return (float)Math.Max(temperature, 0);
         }
+
         public float GetWorldDeltaTemperature(float baseTemp, double rootIrridiance, GasMixture globalMix)
         {
             double temperature = 0;
             temperature += deltaSolarScale * rootIrridiance;
-            for (int i = 0; i < gasTypes.Length; i++)
+            for (int i = 0; i < thermoGases.Length; i++)
             {
                 if (deltaFactors[i] != 0)
                 {
-                    temperature += deltaFactors[i] * Math.Sqrt(globalMix.GetGasTypeRatio(gasTypes[i])) * globalMix.GetMoleValue(gasTypes[i]).Quantity;
+                    temperature += deltaFactors[i] * Math.Sqrt(globalMix.GetGasTypeRatio(thermoGases[i])) * globalMix.GetMoleValue(thermoGases[i]).Quantity.ToDouble();
                 }
             }
-            temperature += deltaTQ * globalMix.TotalMolesGassesAndLiquids;
-            temperature += deltaPa * globalMix.TotalMolesGassesAndLiquids * baseTemp;
-
+            temperature += deltaTQ * globalMix.GetTotalMolesGassesAndLiquids.ToDouble();
+            temperature += deltaPa * globalMix.GetTotalMolesGassesAndLiquids.ToDouble() * baseTemp;
             return (float)Math.Max(temperature, 0);
         }
     }
