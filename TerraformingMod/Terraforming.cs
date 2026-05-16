@@ -20,34 +20,6 @@ using System.Reflection;
 
 namespace TerraformingMod
 {
-    public class GasMixSaveData
-    {
-        public Dictionary<string, float> Moles = new Dictionary<string, float>();
-
-        public GasMixSaveData() { }
-
-        public GasMixSaveData(GasMixture mix)
-        {
-            foreach (var type in SimpleGasMixture.BaseGases)
-            {
-                Moles[type.ToString()] = mix.GetMoleValue(type).Quantity.ToFloat();
-            }
-        }
-
-        public GasMixture Apply()
-        {
-            GasMixture mix = GasMixtureHelper.Create();
-            foreach (var kvp in Moles)
-            {
-                if (Enum.TryParse(kvp.Key, out Chemistry.GasType type))
-                {
-                    mix.Add(new Mole(type, new MoleQuantity((double)kvp.Value), MoleEnergy.Zero));
-                }
-            }
-            return mix;
-        }
-    }
-
     // 1. Capture gas leaving pipes/rooms and entering the world
     [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "GiveToGlobal")]
     public class PlanetaryAtmosphereGivePatch
@@ -112,26 +84,8 @@ namespace TerraformingMod
 
             LightManager.SunPathTraceWorldAtmos = true;
             TerraformingFunctions.ThisGlobalPrecise = new GlobalAtmospherePrecise(Mathf.Abs(WorldSetting.Current.Gravity));
-            TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = GasMixtureHelper.Create();
 
-            if (XmlSaveLoad.Instance.CurrentWorldSave != null)
-            {
-                var fileName = TerraformingSaveFile.GetCurrentSaveFileName();
-
-                ConsoleWindow.Print("Terraforming: Loading from: " + fileName, ConsoleColor.Yellow);
-                object obj = XmlSerialization.Deserialize(TerraformingFunctions.AtmoSerializer, fileName);
-                if (!(obj is TerraformingAtmosphere terraformingAtmosphere))
-                {
-                    ConsoleWindow.Print("Terraforming: Failed to load the terraforming_atmosphere.xml: " + fileName, ConsoleColor.Red);
-                }
-                else
-                {
-                    if (terraformingAtmosphere.GasMix != null)
-                        TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = terraformingAtmosphere.GasMix.Apply();
-                    else
-                        ConsoleWindow.Print("Terraforming: No stored GasMix found");
-                }
-            }
+            // Removed the broken OnLoadMix wipe here. The engine handles the base atmosphere now.
 
             TerraformingFunctions.ReloadGlobalAtmosphere();
             var globalAtmo = TerraformingFunctions.GlobalAtmosphere;
@@ -164,7 +118,6 @@ namespace TerraformingMod
 
             LightManager.SunPathTraceWorldAtmos = true;
             TerraformingFunctions.ThisGlobalPrecise = new GlobalAtmospherePrecise(Mathf.Abs(WorldSetting.Current.Gravity));
-            TerraformingFunctions.ThisGlobalPrecise.OnLoadMix = GasMixtureHelper.Create();
             TerraformingFunctions.ReloadGlobalAtmosphere();
             ConsoleWindow.Print("GlobalPrecise generated (Terraforming mod loaded on client)");
         }
@@ -202,16 +155,6 @@ namespace TerraformingMod
         }
     }
 
-    /* MULTIPLAYER IL TRANSPILER DISABLED TEMPORARILY
-    [HarmonyPatch(typeof(AtmosphereHelper), "ReadStatic")]
-    public class AtmosphereHelperReadStaticPatch { ... }
-    */
-
-    /* SAVE PIPELINE DISABLED TEMPORARILY
-    [HarmonyPatch(typeof(XmlSaveLoad), "WriteWorld")]
-    public class WorldManagerExportWorldSettingDataPatch { ... }
-    */
-
     // 3. Override the engine's core weather/temperature calculations with Terraforming Math
     [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "CacheTemperatureCurveOffsets")]
     public class PlanetaryAtmosphereSimulationTemperaturePatch
@@ -224,10 +167,7 @@ namespace TerraformingMod
                 Atmosphere readOnlyGlobal = PlanetaryAtmosphereSimulation.ReadOnlyGlobal(new WorldGrid(0, 0, 0));
                 if (readOnlyGlobal != null && !readOnlyGlobal.BeingDestroyed)
                 {
-                    // Calculate the terraforming temperature
                     float terraformTemp = TerraformingFunctions.GetTemperature(OrbitalSimulation.TimeOfDay, readOnlyGlobal.GasMixture);
-                    
-                    // Override the game's calculated aggregate temperature with our terraformed temperature
                     PlanetaryAtmosphereSimulation.AggregateTemperature = new TemperatureKelvin(terraformTemp);
                 }
             }
@@ -246,7 +186,6 @@ namespace TerraformingMod
                 Atmosphere readOnlyGlobal = PlanetaryAtmosphereSimulation.ReadOnlyGlobal(new WorldGrid(0, 0, 0));
                 if (readOnlyGlobal != null && !readOnlyGlobal.BeingDestroyed)
                 {
-                    // Update global mixture (which also updates energy via the heat capacity)
                     TerraformingFunctions.ThisGlobalPrecise.UpdateGlobalAtmosphere(PlanetaryAtmosphereSimulation.AggregateTemperature.ToFloat(), readOnlyGlobal);
                 }
             }
@@ -269,11 +208,24 @@ namespace TerraformingMod
 
         public static float GetTemperature(float timeOfDay, GasMixture gasMix)
         {
-            double rootIrridiance = Math.Sqrt(OrbitalSimulation.SolarIrradiance);
+            if (ThisGlobalPrecise == null || !gasMix.IsValid) return 273.15f; 
+
+            double solarIrradiance = 0;
+            if (OrbitalSimulation.System != null)
+            {
+                solarIrradiance = OrbitalSimulation.SolarIrradiance;
+            }
+
+            if (double.IsNaN(solarIrradiance) || solarIrradiance < 0) solarIrradiance = 0;
+
+            double rootIrridiance = Math.Sqrt(solarIrradiance);
 
             float temperatureBase = ThisGlobalPrecise.GetWorldBaseTemperature(rootIrridiance, gasMix);
             float temperatureDelta = ThisGlobalPrecise.GetWorldDeltaTemperature(temperatureBase, rootIrridiance, gasMix);
             float temp = temperatureBase + Mathf.Sin(timeOfDay * 2f * Mathf.PI - Mathf.PI / 4) * temperatureDelta / 2;
+            
+            if (float.IsNaN(temp)) return 273.15f; 
+            
             return temp;
         }
 
@@ -364,7 +316,7 @@ namespace TerraformingMod
             foreach (var type in BaseGases)
             {
                 Moles[type] += gasMix.Moles[type];
-                addedMoles += gasMix.Moles[type];
+                addedMoles += Math.Abs(gasMix.Moles[type]); // Ensure vacuums trip the accumulator too
             }
             return addedMoles;
         }
@@ -427,17 +379,12 @@ namespace TerraformingMod
 
         public GlobalAtmospherePrecise(float gravity)
         {
-            worldSize = 7 * Math.Pow(10, 6);
+            // CHANGED FOR TESTING: Reduced planet size mathematically by 100x
+            // Change back to `7 * Math.Pow(10, 6)` for the real workshop release
+            worldSize = 70000; 
             worldScale = 1 / worldSize;
             this.gravity = Mathf.Abs(gravity);
             rootGravity = Mathf.Sqrt(this.gravity);
-        }
-
-        private GasMixture _OnLoadMix;
-        public GasMixture OnLoadMix
-        {
-            get { return _OnLoadMix; }
-            set { _OnLoadMix = value; }
         }
 
         private float gravity;
@@ -467,12 +414,18 @@ namespace TerraformingMod
             GlobalAtmosphere.GasMixture.SetReadOnly(false);
             if (!NetworkManager.IsClient) 
             {
-                GlobalAtmosphere.GasMixture.Set(OnLoadMix);
+                // NO MORE WIPING THE PLANET!
+                // We just ADD our terraformed deltas on top of the engine's base planetary grid.
                 foreach (var type in BaseGases)
                 {
-                    if (Moles[type] > 0)
+                    double extraMoles = Moles[type];
+                    if (extraMoles > 0)
                     {
-                        GlobalAtmosphere.GasMixture.Add(new Mole(type, new MoleQuantity(Moles[type]), MoleEnergy.Zero));
+                        GlobalAtmosphere.GasMixture.Add(new Mole(type, new MoleQuantity(extraMoles), MoleEnergy.Zero));
+                    }
+                    else if (extraMoles < 0)
+                    {
+                        GlobalAtmosphere.GasMixture.Remove(type, new MoleQuantity(Math.Abs(extraMoles)));
                     }
                 }
             }
