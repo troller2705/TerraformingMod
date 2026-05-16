@@ -191,6 +191,70 @@ namespace TerraformingMod
             }
         }
     }
+    
+    // 5. Ensure newly generated map chunks inherit the Terraformed atmosphere instead of vanilla
+    [HarmonyPatch(typeof(PlanetaryAtmosphereSimulation), "CloneGlobalGasMix")]
+    public class PlanetaryAtmosphereClonePatch
+    {
+        [HarmonyPostfix]
+        public static void Postfix(Atmosphere targetAtmosphere)
+        {
+            if (NetworkManager.IsClient || TerraformingFunctions.ThisGlobalPrecise == null) return;
+
+            // Do not inject terraformed gas if this grid is located up in space
+            if (PlanetaryAtmosphereSimulation.IsInSpaceAtmosphere(targetAtmosphere.WorldGrid)) return;
+
+            // Grab our actively-terraformed template
+            Atmosphere readOnlyGlobal = PlanetaryAtmosphereSimulation.ReadOnlyGlobal(new WorldGrid(0, 0, 0));
+            
+            if (readOnlyGlobal != null && !readOnlyGlobal.BeingDestroyed)
+            {
+                // readOnlyGlobal is exactly 1 standard GridVolume (8000L). 
+                // We scale it to match the new chunk's volume (which might be smaller if terrain is blocking it).
+                double ratio = targetAtmosphere.Volume.ToDouble() / readOnlyGlobal.Volume.ToDouble();
+                
+                GasMixture terraformedMix = GasMixtureHelper.Create();
+                terraformedMix.Add(readOnlyGlobal.GasMixture);
+                terraformedMix.Scale(ratio);
+
+                // Overwrite the vanilla gas the base game just tried to spawn
+                targetAtmosphere.GasMixture.Set(terraformedMix);
+                targetAtmosphere.UpdateCache();
+            }
+        }
+    }
+    
+    // 6. The "Ice Age" Safety Valve (Final Optimized Version)
+    [HarmonyPatch(typeof(AtmosphereHelper), "SpawnIces", new Type[] { typeof(Atmosphere), typeof(GasMixture) })]
+    public class PreventIceCrashPatch
+    {
+        // CONFIG TOGGLE: 
+        // False = Allows natural snow, but voids massive terraforming ice to stop server crashes
+        // True  = Completely disables all outdoor condensation for max performance
+        public static bool DisableAllOutdoorCondensation = true;
+
+        [HarmonyPrefix]
+        // Note: Added 'ref UniTaskVoid __result' to properly handle the struct return
+        public static bool Prefix(Atmosphere atmosphere, GasMixture mixture, ref Cysharp.Threading.Tasks.UniTaskVoid __result)
+        {
+            if (NetworkManager.IsClient) return true;
+
+            // Target ONLY outdoor, un-enclosed world cells. 
+            // Removed redundant null check because the engine guarantees atmosphere here.
+            if (atmosphere.Mode == AtmosphereHelper.AtmosphereMode.World && atmosphere.Room == null)
+            {
+                if (DisableAllOutdoorCondensation || mixture.GetTotalMolesGassesAndLiquids.ToDouble() > 1000)
+                {
+                    // Safely terminate the async struct before aborting the original method
+                    __result = default;
+                    return false; 
+                }
+            }
+            
+            // Let everything else (indoor factories, pipes, etc.) freeze normally
+            return true;
+        }
+    }
 
     public class TerraformingFunctions
     {
