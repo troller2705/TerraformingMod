@@ -224,34 +224,29 @@ namespace TerraformingMod
         }
     }
     
-    // 6. The "Ice Age" Safety Valve (Final Optimized Version)
-    [HarmonyPatch(typeof(AtmosphereHelper), "SpawnIces", new Type[] { typeof(Atmosphere), typeof(GasMixture) })]
+    // 6. The "Ice Age" Safety Valve (Supercooled Gas Version)
+    [HarmonyPatch(typeof(AtmosphereHelper), "FreezeWorldAtmosphere")]
     public class PreventIceCrashPatch
     {
-        // CONFIG TOGGLE: 
-        // False = Allows natural snow, but voids massive terraforming ice to stop server crashes
-        // True  = Completely disables all outdoor condensation for max performance
-        public static bool DisableAllOutdoorCondensation = true;
-
         [HarmonyPrefix]
-        // Note: Added 'ref UniTaskVoid __result' to properly handle the struct return
-        public static bool Prefix(Atmosphere atmosphere, GasMixture mixture, ref Cysharp.Threading.Tasks.UniTaskVoid __result)
+        public static bool Prefix(Atmosphere worldAtmosphere, GasMixture solidifiedGasses)
         {
             if (NetworkManager.IsClient) return true;
 
-            // Target ONLY outdoor, un-enclosed world cells. 
-            // Removed redundant null check because the engine guarantees atmosphere here.
-            if (atmosphere.Mode == AtmosphereHelper.AtmosphereMode.World && atmosphere.Room == null)
+            if (worldAtmosphere != null && worldAtmosphere.Mode == AtmosphereHelper.AtmosphereMode.World)
             {
-                if (DisableAllOutdoorCondensation || mixture.GetTotalMolesGassesAndLiquids.ToDouble() > 1000)
+                bool disableAllCondensation = TerraformingMod.DisableOutdoorCondensationConfig.Value;
+                
+                if (disableAllCondensation || solidifiedGasses.GetTotalMolesGassesAndLiquids.ToDouble() > 1000)
                 {
-                    // Safely terminate the async struct before aborting the original method
-                    __result = default;
+                    // DO NOT remove the gas! 
+                    // By returning false right now, the base game's Remove() is skipped.
+                    // The freezing gas is forced to remain in the atmosphere as "supercooled" gas.
                     return false; 
                 }
             }
             
-            // Let everything else (indoor factories, pipes, etc.) freeze normally
+            // Allow normal, small-scale freezing to proceed (e.g., natural snow)
             return true;
         }
     }
@@ -443,7 +438,7 @@ namespace TerraformingMod
 
         public GlobalAtmospherePrecise(float gravity)
         {
-            // CHANGED FOR TESTING: Reduced planet size mathematically by 100x
+            // CHANGED FOR TESTING
             // Change back to `7 * Math.Pow(10, 6)` for the real workshop release
             worldSize = 70000; 
             worldScale = 1 / worldSize;
